@@ -1,8 +1,11 @@
 import os
 import json
+from datetime import datetime, timezone
+
 import requests
 from fastapi import FastAPI, Request, HTTPException, Query
 
+# ===== ENV =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 TV_SECRET = os.getenv("TV_SECRET")
@@ -12,7 +15,40 @@ if not BOT_TOKEN or not CHAT_ID or not TV_SECRET:
 
 app = FastAPI()
 
+# ===== LOGGING =====
+LOG_FILE = os.getenv("LOG_FILE", "signals.log")  # можно поменять через ENV, но не обязательно
 
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def log_event(event: str, payload: dict):
+    """
+    Пишем лог и в stdout (Render Logs), и в файл (JSONL).
+    """
+    record = {
+        "ts": now_iso(),
+        "event": event,
+        "payload": payload,
+    }
+
+    line = json.dumps(record, ensure_ascii=False)
+
+    # 1) stdout — видно в Render -> Logs
+    print(line, flush=True)
+
+    # 2) файл — на всякий случай (на free может быть не-персистентно)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        # если файл не пишется — не валим сервис
+        print(json.dumps({"ts": now_iso(), "event": "log_file_write_error", "error": str(e)}, ensure_ascii=False),
+              flush=True)
+
+
+# ===== ROUTES =====
 @app.get("/")
 def root():
     return {"status": "ok"}
@@ -20,75 +56,70 @@ def root():
 
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    r = requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=20)
-    if not r.ok:
-        raise RuntimeError(r.text)
-
-
-def build_gold_message(data: dict) -> str:
-    # ожидаем такие ключи:
-    # side: "SELL" / "BUY"
-    # entry_from, entry_to
-    # sl
-    # tps: список тейков (или tp1..tp5)
-    side = (data.get("side") or "").upper() or "SELL"
-
-    entry_from = data.get("entry_from")
-    entry_to = data.get("entry_to")
-
-    sl = data.get("sl")
-
-    tps = data.get("tps")
-    if not isinstance(tps, list):
-        # если пришли отдельные tp1..tp5
-        tps = []
-        for k in ["tp1", "tp2", "tp3", "tp4", "tp5"]:
-            v = data.get(k)
-            if v not in (None, "", "na"):
-                tps.append(v)
-
-    lines = []
-
-    # 1 строка как ты хочешь:
-    if entry_from is not None and entry_to is not None:
-        lines.append(f"GOLD {side} NOW {entry_from}-{entry_to}")
-    else:
-        # запасной вариант, если диапазон не передали
-        price = data.get("price")
-        lines.append(f"GOLD {side} NOW {price}" if price is not None else f"GOLD {side} NOW")
-
-    if sl is not None:
-        lines.append(f"SL {sl}")
-
-    for tp in tps:
-        lines.append(f"TP {tp}")
-
-    # (опционально) таймфрейм
-    tf = data.get("tf") or data.get("timeframe")
-    if tf:
-        lines.append(f"TF {tf}")
-
-    return "\n".join(lines)
+    r = requests.post(
+        url,
+        json={"chat_id": CHAT_ID, "text": text},
+        timeout=20
+    )
+    return r
 
 
 @app.post("/tv-webhook")
-async def tv_webhook(secret: str = Query(...), request: Request = None):
-    # 1) секрет только из query: ?secret=...
+async def tv_webhook(
+    request: Request,
+    secret: str = Query(...),   # <-- ВАЖНО: secret берём из query (?secret=...)
+):
+    # 1) проверка секрета
     if secret != TV_SECRET:
+        log_event("tv_webhook_invalid_secret", {
+            "remote": request.client.host if request.client else None,
+            "provided_secret": secret
+        })
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-    # 2) пытаемся принять JSON, но TradingView иногда шлёт plain text
-    body = await request.body()
-    raw = body.decode("utf-8", errors="ignore").strip()
+    # 2) читаем JSON от TradingView
+    data = await request.json()
 
-    data = None
+    log_event("tv_webhook_received", {
+        "remote": request.client.host if request.client else None,
+        "data": data
+    })
+
+    # 3) формируем текст (пока простой — ты дальше скажешь формат "GOLD SELL NOW...")
+    #   сейчас берём то, что пришло: symbol/side/price/timeframe
+    symbol = data.get("symbol")
+    side = data.get("side")
+    price = data.get("price")
+    tf = data.get("timeframe")
+
+    text = (
+        f"📈 {symbol}\n"
+        f"Side: {side}\n"
+        f"Price: {price}\n"
+        f"TF: {tf}"
+    )
+
+    # 4) отправляем в Telegram + логируем результат
     try:
-        data = json.loads(raw) if raw else {}
-    except Exception:
-        # если пришёл просто текст — отправим как есть
-        send_telegram(raw if raw else "Empty alert")
-        return {"ok": True, "mode": "text"}
+        resp = send_telegram(text)
+        ok = resp.ok
+        body = None
+        try:
+            body = resp.json()
+        except Exception:
+            body = resp.text
 
-    msg = build_gold_message(data)
-    send_telegram(msg)
-    return {"ok": True, "mode": "json"}
+        log_event("telegram_send_result", {
+            "ok": ok,
+            "status_code": resp.status_code,
+            "response": body
+        })
+
+        if not ok:
+            raise RuntimeError(f"Telegram error: {resp.status_code} {resp.text}")
+
+    except Exception as e:
+        log_event("telegram_send_error", {"error": str(e)})
+        raise
+
+    return {"ok": True}
