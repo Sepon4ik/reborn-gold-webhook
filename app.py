@@ -29,15 +29,17 @@ def send_telegram(text: str):
 
 
 @app.post("/tv-webhook")
-async def tv_webhook(request: Request):
+async def tv_webhook(
+    request: Request,
+    secret: str = Query(...)
+):
     data = await request.json()
 
-    # проверка секрета
-    if data.get("secret") != TV_SECRET:
+    if secret != TV_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
     text = (
-        f"📊 {data.get('symbol')}\n"
+        f"📈 {data.get('symbol')}\n"
         f"Side: {data.get('side')}\n"
         f"Price: {data.get('price')}\n"
         f"TF: {data.get('timeframe')}"
