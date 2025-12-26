@@ -38,16 +38,18 @@ async def tv_webhook(
     if secret != TV_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-   text = (
-    f"GOLD SELL NOW {data.get('entry_from')}-{data.get('entry_to')}\n"
-    f"SL {data.get('sl')}\n"
-    f"TP {data.get('tp1')}\n"
-    f"TP {data.get('tp2')}\n"
-    f"TP {data.get('tp3')}\n"
-    f"TP {data.get('tp4')}"
-)
-
+    text = (
+        f"GOLD {data.get('side')} NOW {data.get('entry_from')}-{data.get('entry_to')}\n"
+        f"SL {data.get('sl')}\n"
+        f"TP {data.get('tp1')}\n"
+        f"TP {data.get('tp2')}\n"
+        f"TP {data.get('tp3')}\n"
+        f"TP {data.get('tp4')}"
     )
+
+    send_telegram(text)
+    return {"ok": True}
+)
 
     send_telegram(text)
     return {"ok": True}
